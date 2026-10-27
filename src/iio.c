@@ -220,7 +220,8 @@ struct iio_context *iio_context_new(const char *name)
     ctx->fd = -1;
     ctx->timeout_ms = DEFAULT_TIMEOUT;
     iio_library_get_version(&ctx->major, &ctx->minor, ctx->git_tag);
-    if (!ctx->name) {
+    if (!ctx->name || pthread_mutex_init(&ctx->lock.mutex, 0) != 0) {
+        free(ctx->name);
         free(ctx);
         return 0;
     }
@@ -263,6 +264,7 @@ void iio_context_destroy(struct iio_context *ctx)
         iio_net_write_all(ctx->fd, "\r\nEXIT\r\n", 8);
         close(ctx->fd);
     }
+    pthread_mutex_destroy(&ctx->lock.mutex);
     free(ctx->name), free(ctx->description), free(ctx->xml), free(ctx->host);
     free(ctx);
 }
@@ -545,10 +547,16 @@ int iio_context_set_timeout(struct iio_context *ctx, unsigned int timeout_ms)
         char cmd[48];
         snprintf(cmd, sizeof(cmd), "TIMEOUT %u\r\n", timeout_ms);
         iio_lock_take(&ctx->lock);
-        int ret = iio_net_command(ctx->fd, ctx->timeout_ms, cmd);
+        int value;
+        int ret = iio_net_ctx_command(ctx, cmd, &value);
+        if (ret == 0 && value < 0)
+            ret = value;
+        if (ret == 0) {
+            ctx->timeout_ms = timeout_ms;
+            ctx->timeout_sent = true;           /* (for a new connection: iionet.c) */
+        }
         iio_lock_give(&ctx->lock);
-        if (ret < 0)
-            return ret;
+        return ret;
     }
     ctx->timeout_ms = timeout_ms;
     return 0;
@@ -705,12 +713,16 @@ int iio_device_get_trigger(const struct iio_device *dev, const struct iio_device
     char cmd[320], name[256];
     snprintf(cmd, sizeof(cmd), "GETTRIG %s\r\n", dev->id);
     iio_lock_take(&ctx->lock);
-    int ret = iio_net_command(ctx->fd, ctx->timeout_ms, cmd);
-    int length = ret;
-    if (ret > 0 && (size_t)ret + 1 > sizeof(name))
-        ret = -EIO;                         /* (connection out of step: no names this long) */
-    else if (ret > 0)
-        ret = iio_net_read_all(ctx->fd, ctx->timeout_ms, name, (size_t)length + 1);
+    int length;
+    int ret = iio_net_ctx_command(ctx, cmd, &length);
+    if (ret == 0 && length < 0) {
+        ret = length;
+    } else if (ret == 0 && (size_t)length + 1 > sizeof(name)) {
+        iio_net_ctx_drop(ctx);              /* (out of step: no names are this long) */
+        ret = -EIO;
+    } else if (ret == 0 && length > 0) {
+        ret = iio_net_ctx_read(ctx, name, (size_t)length + 1);
+    }
     iio_lock_give(&ctx->lock);
     if (ret < 0)
         return ret;
@@ -739,9 +751,10 @@ int iio_device_set_trigger(const struct iio_device *dev, const struct iio_device
     else
         snprintf(cmd, sizeof(cmd), "SETTRIG %s\r\n", dev->id);
     iio_lock_take(&ctx->lock);
-    int ret = iio_net_command(ctx->fd, ctx->timeout_ms, cmd);
+    int value;
+    int ret = iio_net_ctx_command(ctx, cmd, &value);
     iio_lock_give(&ctx->lock);
-    return ret < 0 ? ret : 0;
+    return ret < 0 ? ret : value < 0 ? value : 0;
 }
 
 int iio_device_set_kernel_buffers_count(const struct iio_device *dev, unsigned int nb_buffers)
@@ -754,9 +767,10 @@ int iio_device_set_kernel_buffers_count(const struct iio_device *dev, unsigned i
     char cmd[320];
     snprintf(cmd, sizeof(cmd), "SET %s BUFFERS_COUNT %u\r\n", dev->id, nb_buffers);
     iio_lock_take(&ctx->lock);
-    int ret = iio_net_command(ctx->fd, ctx->timeout_ms, cmd);
+    int value;
+    int ret = iio_net_ctx_command(ctx, cmd, &value);
     iio_lock_give(&ctx->lock);
-    return ret < 0 ? ret : 0;
+    return ret < 0 ? ret : value < 0 ? value : 0;
 }
 
 /* --- Attributes: one set of helpers for the four kinds --- */

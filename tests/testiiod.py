@@ -25,6 +25,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 
 VERSION = "0.26.0000000"
 SCANS_RX = "cf-ad9361-lpc"
@@ -66,7 +67,8 @@ DEVICES = [
      "attrs": [("calib_mode", "auto"), ("ensm_mode", "fdd"),
                ("ensm_mode_available", "sleep wait alert fdd pinctrl pinctrl_fdd_indep"),
                ("xo_correction", "40000000"), ("filter_fir_config", "FIR Rx: 0,0 Tx: 0,0")],
-     "debug": [("direct_reg_access", "0x0"), ("loopback", "0"), ("digital_tune_skip", "0")],
+     "debug": [("direct_reg_access", "0x0"), ("loopback", "0"), ("digital_tune_skip", "0"),
+               ("slow_answer", "late")],
      "buffer": []},
     {"id": "iio:device1", "name": "xadc",
      "channels": [
@@ -113,6 +115,10 @@ DEVICES = [
 
 # Values that fail on reading (iiod passes the driver's error): -EINVAL.
 FAILING = {("iio:device0", "OUTPUT", "altvoltage0", "fastlock_recall")}
+# Answered after SLOW_S seconds: longer than iiotest's shortened timeout, so
+# the answer comes late, as over a stalled link.
+SLOW = {("iio:device0", "DEBUG", "", "slow_answer")}
+SLOW_S = 1.5
 
 
 def escape(text):
@@ -277,6 +283,8 @@ def handle(conn, server):
                     else:
                         value = server.values[key]
                 data = value.encode()
+                if key in SLOW:
+                    time.sleep(SLOW_S)
                 answer(len(data))
                 send(data + b"\n")
         elif cmd == "GETTRIG":
@@ -351,7 +359,14 @@ def serve(port, address="127.0.0.1"):
     say(f"testiiod: listening on {port}")
     while True:
         conn, _ = s.accept()
-        threading.Thread(target=lambda c=conn: (handle(c, server), c.close()), daemon=True).start()
+        threading.Thread(target=lambda c=conn: (serve_one(c, server), c.close()), daemon=True).start()
+
+
+def serve_one(conn, server):
+    try:
+        handle(conn, server)
+    except OSError:
+        pass                    # (a client that went away, e.g. after a late answer)
 
 
 def parse_format(text):
@@ -411,6 +426,8 @@ def expect(ip):
     out.append(t + "ensm_mode 3 'fdd'")
     out.append(t + f"ensm_mode in 3 bytes: {errtext('EIO')}")
     out.append(t + "after it, calib_mode 4 'auto'")
+    out.append(t + "slow_answer in 500 ms: timed out 1; after it, calib_mode 4 'auto', "
+                   "xo_correction 8 '40000000'")
     out.append(t + f"fastlock_recall: {errtext('EINVAL')}")
     out.append(t + f"nonexistent: {errtext('ENOENT')}")
     out.append(t + "rx buffer watermark 4 '2048'")

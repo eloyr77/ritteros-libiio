@@ -136,6 +136,17 @@ int main(int argc, char **argv)
     printf(T "ensm_mode in 3 bytes: %s\n", err((int)n));
     n = iio_device_attr_read(phy, "calib_mode", text, sizeof(text));
     printf(T "after it, calib_mode %zd '%s'\n", n, text);
+    /* An answer that comes after the timeout must not be taken for the next
+     * question's: the library opens a new connection (and gives the server
+     * the shortened timeout again there: check.sh looks). */
+    iio_context_set_timeout(ctx, 500);
+    n = iio_device_debug_attr_read(phy, "slow_answer", text, sizeof(text));
+    printf(T "slow_answer in 500 ms: timed out %d", n == -ETIMEDOUT);
+    n = iio_device_attr_read(phy, "calib_mode", text, sizeof(text));
+    printf("; after it, calib_mode %zd '%s'", n, text);
+    n = iio_device_attr_read(phy, "xo_correction", text, sizeof(text));
+    printf(", xo_correction %zd '%s'\n", n, text);
+    iio_context_set_timeout(ctx, 5000);
     n = iio_channel_attr_read(lo, "fastlock_recall", text, sizeof(text));
     printf(T "fastlock_recall: %s\n", err((int)n));
     n = iio_channel_attr_read(lo, "nonexistent", text, sizeof(text));

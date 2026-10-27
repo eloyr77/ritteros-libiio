@@ -68,6 +68,12 @@ check_sent() {
     else
         fail "a cyclic buffer opened as one"
     fi
+    # (after the late answer: a new connection, given the shortened timeout again)
+    if [ "$(grep -c "testiiod: TIMEOUT 500$" "$log")" -ge 2 ]; then
+        pass "after a timeout, a new connection with the same server timeout"
+    else
+        fail "after a timeout, a new connection with the same server timeout"
+    fi
 }
 
 case "$mode" in

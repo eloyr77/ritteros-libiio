@@ -37,14 +37,12 @@
 
 void iio_lock_take(struct iio_lock *l)
 {
-    unsigned me = __atomic_fetch_add(&l->next, 1, __ATOMIC_ACQUIRE);
-    while (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != me)
-        usleep(1000);
+    pthread_mutex_lock(&l->mutex);
 }
 
 void iio_lock_give(struct iio_lock *l)
 {
-    __atomic_fetch_add(&l->serving, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&l->mutex);
 }
 
 int iio_net_connect(uint32_t ip, uint16_t port, unsigned timeout_ms)
@@ -179,6 +177,71 @@ int iio_net_command(int fd, unsigned timeout_ms, const char *cmd)
     return ret < 0 ? ret : value;
 }
 
+/* --- The context's connection --- */
+
+void iio_net_ctx_drop(struct iio_context *ctx)
+{
+    if (ctx->fd >= 0)
+        close(ctx->fd);
+    ctx->fd = -1;
+}
+
+/* An exchange's step: a failure drops the connection (see iiopriv.h). */
+static int checked(struct iio_context *ctx, int ret)
+{
+    if (ret < 0)
+        iio_net_ctx_drop(ctx);
+    return ret;
+}
+
+int iio_net_ctx_send(struct iio_context *ctx, const char *cmd)
+{
+    if (ctx->fd < 0) {
+        int fd = iio_net_connect(ctx->ip, ctx->port, ctx->timeout_ms);
+        if (fd < 0)
+            return fd;
+        /* iiod keeps the timeout per connection: the new one gets it too. */
+        if (ctx->timeout_sent) {
+            char line[48];
+            snprintf(line, sizeof(line), "TIMEOUT %u\r\n", ctx->timeout_ms);
+            int ret = iio_net_command(fd, ctx->timeout_ms, line);
+            if (ret < 0) {
+                close(fd);
+                return ret;
+            }
+        }
+        ctx->fd = fd;
+    }
+    return checked(ctx, iio_net_write_all(ctx->fd, cmd, strlen(cmd)));
+}
+
+int iio_net_ctx_write(struct iio_context *ctx, const void *src, size_t len)
+{
+    if (ctx->fd < 0)
+        return -EPIPE;
+    return checked(ctx, iio_net_write_all(ctx->fd, src, len));
+}
+
+int iio_net_ctx_integer(struct iio_context *ctx, int *value)
+{
+    if (ctx->fd < 0)
+        return -EPIPE;
+    return checked(ctx, read_integer(ctx->fd, ctx->timeout_ms, value, 0));
+}
+
+int iio_net_ctx_read(struct iio_context *ctx, void *dst, size_t len)
+{
+    if (ctx->fd < 0)
+        return -EPIPE;
+    return checked(ctx, iio_net_read_all(ctx->fd, ctx->timeout_ms, dst, len));
+}
+
+int iio_net_ctx_command(struct iio_context *ctx, const char *cmd, int *value)
+{
+    int ret = iio_net_ctx_send(ctx, cmd);
+    return ret < 0 ? ret : iio_net_ctx_integer(ctx, value);
+}
+
 /* The part of a READ or WRITE command after the device: which kind of
  * attribute, and its name. */
 static void attr_target(char *out, size_t size, const struct iio_device *dev,
@@ -197,12 +260,12 @@ static void attr_target(char *out, size_t size, const struct iio_device *dev,
 
 /* Throw away n bytes of an answer that does not fit, so that the
  * connection stays in step. */
-static int discard(int fd, unsigned timeout_ms, size_t n)
+static int discard(struct iio_context *ctx, size_t n)
 {
     char sink[256];
     while (n) {
         size_t k = n < sizeof(sink) ? n : sizeof(sink);
-        int ret = iio_net_read_all(fd, timeout_ms, sink, k);
+        int ret = iio_net_ctx_read(ctx, sink, k);
         if (ret < 0)
             return ret;
         n -= k;
@@ -222,14 +285,17 @@ ssize_t iio_net_attr_read(const struct iio_device *dev, const struct iio_channel
     attr_target(target, sizeof(target), dev, chn, kind, attr);
     snprintf(cmd, sizeof(cmd), "READ %s\r\n", target);
     iio_lock_take(&ctx->lock);
-    ssize_t ret = iio_net_command(ctx->fd, ctx->timeout_ms, cmd);
-    if (ret >= 0) {
-        size_t n = (size_t)ret;
+    int value;
+    ssize_t ret = iio_net_ctx_command(ctx, cmd, &value);
+    if (ret == 0 && value < 0) {
+        ret = value;
+    } else if (ret == 0) {
+        size_t n = (size_t)value;
         if (n + 1 > len) {                  /* the value and its "\n" */
-            int d = discard(ctx->fd, ctx->timeout_ms, n + 1);
+            int d = discard(ctx, n + 1);
             ret = d < 0 ? d : -EIO;
         } else {
-            int r = iio_net_read_all(ctx->fd, ctx->timeout_ms, dst, n + 1);
+            int r = iio_net_ctx_read(ctx, dst, n + 1);
             if (r < 0) {
                 ret = r;
             } else {
@@ -253,12 +319,12 @@ ssize_t iio_net_attr_write(const struct iio_device *dev, const struct iio_channe
     attr_target(target, sizeof(target), dev, chn, kind, attr);
     snprintf(cmd, sizeof(cmd), "WRITE %s %lu\r\n", target, (unsigned long)len);
     iio_lock_take(&ctx->lock);
-    int ret = iio_net_write_all(ctx->fd, cmd, strlen(cmd));
+    int ret = iio_net_ctx_send(ctx, cmd);
     if (ret == 0)
-        ret = iio_net_write_all(ctx->fd, src, len);
+        ret = iio_net_ctx_write(ctx, src, len);
     int value = 0;
     if (ret == 0)
-        ret = read_integer(ctx->fd, ctx->timeout_ms, &value, 0);
+        ret = iio_net_ctx_integer(ctx, &value);
     iio_lock_give(&ctx->lock);
     return ret < 0 ? ret : value;
 }
@@ -333,36 +399,49 @@ static int read_mask(struct iio_buffer *buf, unsigned timeout_ms)
     return 0;
 }
 
+/* A buffer's connection that failed on the way is as out of step as the
+ * context's (iiopriv.h): it is closed, and later refills and pushes fail
+ * (EPIPE) until the program makes a new buffer. Returns ret. */
+static ssize_t buffer_failed(struct iio_buffer *buf, ssize_t ret)
+{
+    if (buf->fd >= 0)
+        close(buf->fd);
+    buf->fd = -1;
+    return ret;
+}
+
 ssize_t iio_net_readbuf(struct iio_buffer *buf, void *dst, size_t len)
 {
     unsigned timeout = buf->dev->ctx->timeout_ms;
     char cmd[320];
+    if (buf->fd < 0)
+        return -EPIPE;
     snprintf(cmd, sizeof(cmd), "READBUF %s %lu\r\n", buf->dev->id, (unsigned long)len);
     int ret = iio_net_write_all(buf->fd, cmd, strlen(cmd));
     if (ret < 0)
-        return ret;
+        return buffer_failed(buf, ret);
     size_t got = 0;
     bool mask_read = false;
     while (got < len) {
         int n;
         ret = read_integer(buf->fd, timeout, &n, &buf->cancelled);
         if (ret < 0)
-            return ret;
+            return buffer_failed(buf, ret);
         if (n < 0)
-            return n;
+            return n;                       /* (the server's error: still in step) */
         if (n == 0)
             break;
         if (!mask_read) {
             ret = read_mask(buf, timeout);
             if (ret < 0)
-                return ret;
+                return buffer_failed(buf, ret);
             mask_read = true;
         }
         if ((size_t)n > len - got)
-            return -EIO;                    /* (more than asked for) */
+            return buffer_failed(buf, -EIO);    /* (more than asked for) */
         ret = read_all_cancel(buf->fd, timeout, (char *)dst + got, (size_t)n, &buf->cancelled);
         if (ret < 0)
-            return ret;
+            return buffer_failed(buf, ret);
         got += (size_t)n;
     }
     return (ssize_t)got;
@@ -372,19 +451,21 @@ ssize_t iio_net_writebuf(struct iio_buffer *buf, const void *src, size_t len)
 {
     unsigned timeout = buf->dev->ctx->timeout_ms;
     char cmd[320];
+    if (buf->fd < 0)
+        return -EPIPE;
     snprintf(cmd, sizeof(cmd), "WRITEBUF %s %lu\r\n", buf->dev->id, (unsigned long)len);
     int ret = iio_net_write_all(buf->fd, cmd, strlen(cmd));
     int value;
     if (ret == 0)
         ret = read_integer(buf->fd, timeout, &value, &buf->cancelled);
     if (ret < 0)
-        return ret;
+        return buffer_failed(buf, ret);
     if (value < 0)
         return value;
     ret = iio_net_write_all(buf->fd, src, len);
     if (ret == 0)
         ret = read_integer(buf->fd, timeout, &value, &buf->cancelled);
     if (ret < 0)
-        return ret;
+        return buffer_failed(buf, ret);
     return value < 0 ? value : (ssize_t)len;
 }

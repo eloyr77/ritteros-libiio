@@ -8,16 +8,14 @@
 
 #include <errno.h>
 #include <iio.h>
+#include <pthread.h>
 #include <stdint.h>
 
-#ifndef ENXIO
-#define ENXIO 6                     /* (Linux's number; RitterOS's errno.h lacks it) */
-#endif
-
-/* A lock of the connection: a ticket lock (fair; a waiter sleeps a tick,
- * as malloc's: there is no futex). */
+/* A lock of the connection: a pthread mutex (RitterOS's wait in the
+ * kernel's futex, since its step 54a; the ticket lock this was before
+ * slept a 10 ms tick between looks). Made and ended with the context. */
 struct iio_lock {
-    unsigned next, serving;
+    pthread_mutex_t mutex;
 };
 void iio_lock_take(struct iio_lock *l);
 void iio_lock_give(struct iio_lock *l);
@@ -69,8 +67,9 @@ struct iio_context {
     char *host;                     /* as given, for clone */
     uint32_t ip;
     uint16_t port;
-    int fd;
+    int fd;                         /* -1: dropped, opened again by the next exchange */
     unsigned timeout_ms;
+    bool timeout_sent;              /* iio_context_set_timeout told the server (per connection) */
     unsigned major, minor;
     char git_tag[8];
     struct iio_lock lock;
@@ -98,6 +97,21 @@ int iio_net_command(int fd, unsigned timeout_ms, const char *cmd);
 int iio_net_read_all(int fd, unsigned timeout_ms, void *dst, size_t len);
 int iio_net_write_all(int fd, const void *src, size_t len);
 int iio_net_integer(int fd, unsigned timeout_ms, int *value);
+/* Exchanges on the context's connection (its lock held). A failure on the
+ * way (a timeout, a closed connection, an answer that makes no sense)
+ * leaves the connection at an unknown place in the protocol: a late answer
+ * may still come and would be read as the next one's. So the connection is
+ * dropped, and the next exchange opens a new one. _send begins an exchange
+ * (opening the connection if needed), the others continue it. An answer's
+ * number comes back in *value: a negative one is the server's error, the
+ * connection is still in step. */
+int iio_net_ctx_send(struct iio_context *ctx, const char *cmd);
+int iio_net_ctx_command(struct iio_context *ctx, const char *cmd, int *value);
+int iio_net_ctx_write(struct iio_context *ctx, const void *src, size_t len);
+int iio_net_ctx_integer(struct iio_context *ctx, int *value);
+int iio_net_ctx_read(struct iio_context *ctx, void *dst, size_t len);
+void iio_net_ctx_drop(struct iio_context *ctx);
+
 ssize_t iio_net_attr_read(const struct iio_device *dev, const struct iio_channel *chn,
                           enum iio_attr_kind kind, const char *attr, char *dst, size_t len);
 ssize_t iio_net_attr_write(const struct iio_device *dev, const struct iio_channel *chn,

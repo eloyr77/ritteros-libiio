@@ -53,6 +53,10 @@ make check-host                               # the library and iiotest on this 
 make check HOST=root@ADDRESS IIOD_FROM=MAC    # iiotest, iio_info, iio_attr on the RitterOS machine
 ```
 
+`make install` puts iiotest in `/system/ARCH/test`, which only RitterOS's
+test images have: on an installed machine (no such folder) copy it to
+`/tmp` instead and run it there against the pretend Pluto.
+
 Both start `tests/testiiod.py` here (port 47791, `IIOD_PORT=`). `IIOD_FROM`
 is this Mac's address as the RitterOS machine sees it (10.0.2.2 from QEMU's
 user network; on a real network the Mac's LAN address, and the server then
@@ -86,11 +90,23 @@ change the model only when the pretend Pluto itself changes.
   than the caller's buffer must be read past, or the connection is out of
   step. READBUF's answer comes in pieces, the mask only with the first; it
   ends when the count asked for has come.
-- Error numbers on the wire are Linux's, which are RitterOS's too (`ENXIO`
-  is defined in iiopriv.h: RitterOS's errno.h lacks it).
-- RitterOS has no futex: the connection's lock is a ticket lock that sleeps
-  a millisecond between looks. Waits on the server are cut into 100 ms
-  slices so that `iio_buffer_cancel` from another thread is noticed.
+- Error numbers on the wire are Linux's, which are RitterOS's too.
+- **A failed exchange drops its connection.** A timeout, a closed
+  connection or an answer that makes no sense leaves the connection at an
+  unknown place in the protocol: the late answer may still come, and was
+  read as the next question's (seen on the real Pluto over a stalled NCM
+  link: every value after the stall belonged to an earlier attribute). The
+  context's connection is closed and the next exchange opens a new one,
+  giving it the server timeout again if the program set one (iiod keeps it
+  per connection); all context exchanges go through `iio_net_ctx_*`
+  (iiopriv.h), never `ctx->fd` directly. A buffer's connection is closed
+  the same way; its later refills and pushes fail with EPIPE until the
+  program makes a new buffer. A negative number in an answer is the
+  server's error and the connection is still in step.
+- The connection's lock is a pthread mutex (RitterOS's wait on its futex,
+  since its step 54a; until then a ticket lock slept a 10 ms tick between
+  looks). Waits on the server are cut into 100 ms slices so that
+  `iio_buffer_cancel` from another thread is noticed.
 
 ## Still to come
 
