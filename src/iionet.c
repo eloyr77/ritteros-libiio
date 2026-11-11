@@ -363,7 +363,7 @@ void iio_net_close(struct iio_buffer *buf)
 {
     if (buf->fd < 0)
         return;
-    if (!buf->cancelled) {
+    if (!__atomic_load_n(&buf->cancelled, __ATOMIC_ACQUIRE)) {
         char cmd[320];
         snprintf(cmd, sizeof(cmd), "CLOSE %s\r\n", buf->dev->id);
         iio_net_command(buf->fd, buf->dev->ctx->timeout_ms, cmd);

@@ -1354,7 +1354,7 @@ const struct iio_device *iio_buffer_get_device(const struct iio_buffer *buf)
 
 ssize_t iio_buffer_refill(struct iio_buffer *buf)
 {
-    if (buf->cancelled)
+    if (__atomic_load_n(&buf->cancelled, __ATOMIC_ACQUIRE))
         return -EBADF;
     if (buf->output)
         return -EINVAL;
@@ -1371,7 +1371,7 @@ ssize_t iio_buffer_refill(struct iio_buffer *buf)
 
 ssize_t iio_buffer_push_partial(struct iio_buffer *buf, size_t samples_count)
 {
-    if (buf->cancelled)
+    if (__atomic_load_n(&buf->cancelled, __ATOMIC_ACQUIRE))
         return -EBADF;
     size_t length = samples_count * buf->sample_size;
     if (!buf->output || length == 0 || samples_count > buf->samples)

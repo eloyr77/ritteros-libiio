@@ -78,7 +78,8 @@ struct iio_context {
 struct iio_buffer {
     const struct iio_device *dev;
     int fd;                         /* its own connection */
-    bool cyclic, output, pushed, cancelled;
+    bool cyclic, output, pushed;
+    bool cancelled;                 /* iio_buffer_cancel sets it from any thread: only __atomic_ */
     size_t samples, sample_size, length, data_length;   /* length: allocated */
     char *data;
     uint32_t *mask;                 /* the channels the server sends */

@@ -106,7 +106,10 @@ change the model only when the pretend Pluto itself changes.
 - The connection's lock is a pthread mutex (RitterOS's wait on its futex,
   since its step 54a; until then a ticket lock slept a 10 ms tick between
   looks). Waits on the server are cut into 100 ms slices so that
-  `iio_buffer_cancel` from another thread is noticed.
+  `iio_buffer_cancel` from another thread is noticed. The buffer's
+  `cancelled` flag is read and written only with `__atomic_` (RitterOS
+  runs threads on every core: a plain read beside another thread's write
+  is a data race, the SDK guide's note on threads).
 
 ## Still to come
 
