@@ -13,3 +13,5 @@ iio_attr -u ip:192.168.2.1 -c ad9361-phy RX_LO frequency 433920000
 ```
 
 See `CLAUDE.md` for building, checking and the facts the code depends on.
+
+Licence: GPL-3.0 (`LICENSE`). Our own code; libiio itself (LGPL-2.1) is not copied here.
